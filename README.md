@@ -63,7 +63,7 @@ docker images | grep private-dev:ssh-gpu
 sshd -T | egrep 'allowusers|permitrootlogin'
 ```
 
-## Minimal operation examples (generated scripts)
+## Minimal operation examples
 
 Create user:
 
@@ -88,9 +88,3 @@ GPU usage attribution:
 ```bash
 /root/blame_gpu_use.sh
 ```
-
-## Notes
-
-- This repo is intentionally minimal: **only bootstrap script is versioned**.
-- Operational scripts are generated on the target host to keep deployment one-step and reproducible.
-- Rebuild operations terminate running tasks in the target container.
