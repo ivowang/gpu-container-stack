@@ -1,51 +1,153 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # One-shot bootstrap for a fresh GPU server.
-# Target state: same Docker-based private-container ops structure as this machine.
+# Preconditions:
+# 1) run as root
+# 2) data disk mounted at /data
+# 3) full outbound network access
 
 export DEBIAN_FRONTEND=noninteractive
+umask 022
 
 IMAGE_NAME="private-dev:ssh-gpu"
-CUDA_IMAGE="nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04"
+SELECTED_CUDA_IMAGE=""
+PLATFORM_ENV_FILE="/data/docker-private-users/platform.env"
+
+CUDA_IMAGE_CANDIDATES=(
+  "nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04"
+  "nvidia/cuda:12.4.1-runtime-ubuntu22.04"
+  "nvidia/cuda:12.2.2-runtime-ubuntu22.04"
+  "nvidia/cuda:11.8.0-runtime-ubuntu22.04"
+)
+
+CUDA_MIRRORS=(
+  ""
+  "docker.m.daocloud.io/"
+  "swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/"
+)
 
 log() { echo "[INFO] $*"; }
+warn() { echo "[WARN] $*" >&2; }
 err() { echo "[ERROR] $*" >&2; exit 1; }
+
+on_error() {
+  local ec=$?
+  local line="${BASH_LINENO[0]:-unknown}"
+  echo "[ERROR] setup failed at line ${line} (exit=${ec})" >&2
+  exit "${ec}"
+}
+trap on_error ERR
+
+run_with_retry() {
+  local tries="$1"
+  shift
+  local i
+  for ((i=1; i<=tries; i++)); do
+    if "$@"; then
+      return 0
+    fi
+    if [[ "${i}" -lt "${tries}" ]]; then
+      warn "Command failed (attempt ${i}/${tries}), retrying: $*"
+      sleep $((i * 2))
+    fi
+  done
+  return 1
+}
+
+restart_service() {
+  local svc="$1"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart "${svc}" 2>/dev/null || true
+    systemctl is-active --quiet "${svc}" 2>/dev/null && return 0
+  fi
+  if command -v service >/dev/null 2>&1; then
+    service "${svc}" restart >/dev/null 2>&1 || true
+    return 0
+  fi
+  return 1
+}
+
+reload_service() {
+  local svc="$1"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl reload "${svc}" 2>/dev/null && return 0
+  fi
+  if command -v service >/dev/null 2>&1; then
+    service "${svc}" reload >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
 
 require_root() {
   [[ "$(id -u)" -eq 0 ]] || err "Please run as root."
 }
 
+ensure_base_requirements() {
+  command -v apt-get >/dev/null 2>&1 || err "apt-get not found. This script currently supports apt-based systems."
+  command -v curl >/dev/null 2>&1 || true
+}
+
 ensure_data_mount() {
   [[ -d /data ]] || err "/data not found. Please mount data disk to /data first."
+  if command -v mountpoint >/dev/null 2>&1; then
+    mountpoint -q /data || err "/data exists but is not a mounted filesystem."
+  fi
+}
+
+check_network_access() {
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "curl not found yet; skip explicit network pre-check."
+    return 0
+  fi
+  log "Checking outbound network reachability..."
+  local ok=0
+  for u in \
+    "https://mirrors.aliyun.com/ubuntu" \
+    "https://nvidia.github.io/libnvidia-container/gpgkey" \
+    "https://registry-1.docker.io/v2/"; do
+    if curl -fsSLI --max-time 8 "${u}" >/dev/null 2>&1; then
+      ok=$((ok + 1))
+    fi
+  done
+  [[ "${ok}" -ge 2 ]] || err "Outbound network check failed. Ensure complete internet access."
 }
 
 install_base_packages() {
   log "Installing base packages..."
-  apt-get update
-  apt-get install -y docker.io jq curl gpg ca-certificates
+  run_with_retry 3 apt-get update
+  run_with_retry 3 apt-get install -y \
+    docker.io jq curl gpg ca-certificates coreutils findutils util-linux
 }
 
 install_nvidia_toolkit() {
   log "Installing nvidia-container-toolkit..."
   install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-    | gpg --dearmor -o /etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg
-  curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
-    | sed 's#deb https://#deb [signed-by=/etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-    > /etc/apt/sources.list.d/nvidia-container-toolkit.list
-  apt-get update
-  apt-get install -y nvidia-container-toolkit
+  run_with_retry 3 bash -lc \
+    "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg"
+  run_with_retry 3 bash -lc \
+    "curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list"
+  run_with_retry 3 apt-get update
+  run_with_retry 3 apt-get install -y nvidia-container-toolkit
 }
 
 configure_docker_runtime() {
   log "Configuring Docker NVIDIA runtime..."
+  command -v nvidia-ctk >/dev/null 2>&1 || err "nvidia-ctk not found after installation."
   nvidia-ctk runtime configure --runtime=docker >/dev/null
-  (systemctl restart docker || service docker restart)
+  restart_service docker || err "Failed to restart docker service."
+  sleep 1
+  docker info >/dev/null || err "Docker daemon is not reachable after restart."
+}
+
+ensure_nvidia_driver_ready() {
+  command -v nvidia-smi >/dev/null 2>&1 || err "nvidia-smi not found. Install NVIDIA host driver first."
+  nvidia-smi -L >/dev/null 2>&1 || err "nvidia-smi failed on host. Fix driver before running setup."
 }
 
 configure_host_ssh_policy() {
   log "Configuring host SSH policy: only root can login..."
+  install -m 0755 -d /etc/ssh/sshd_config.d
   cat > /etc/ssh/sshd_config.d/99-root-only.conf <<'EOF'
 PermitRootLogin yes
 AllowUsers root
@@ -60,7 +162,7 @@ EOF
   fi
 
   sshd -t
-  (systemctl reload ssh || service ssh reload)
+  reload_service ssh || restart_service ssh || warn "Could not reload ssh service automatically; please reload manually if needed."
 }
 
 prepare_data_dirs() {
@@ -72,10 +174,54 @@ prepare_data_dirs() {
   chmod 600 /data/docker-private-users/registry.tsv
 }
 
+pull_image_from_any_mirror() {
+  local canonical="$1"
+  local mirror ref
+  for mirror in "${CUDA_MIRRORS[@]}"; do
+    ref="${mirror}${canonical}"
+    log "Trying image: ${ref}"
+    if run_with_retry 2 docker pull "${ref}" >/dev/null 2>&1; then
+      if [[ "${ref}" != "${canonical}" ]]; then
+        docker tag "${ref}" "${canonical}" >/dev/null
+      fi
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_working_cuda_image() {
+  log "Selecting a compatible CUDA base image..."
+  local img
+  for img in "${CUDA_IMAGE_CANDIDATES[@]}"; do
+    if ! pull_image_from_any_mirror "${img}"; then
+      continue
+    fi
+    if docker run --rm --gpus all --entrypoint nvidia-smi "${img}" -L >/dev/null 2>&1; then
+      SELECTED_CUDA_IMAGE="${img}"
+      log "Selected CUDA image: ${SELECTED_CUDA_IMAGE}"
+      return 0
+    fi
+    warn "Image pulled but failed runtime GPU check: ${img}"
+  done
+  err "No compatible CUDA image found from candidates."
+}
+
+write_platform_env() {
+  mkdir -p "$(dirname "${PLATFORM_ENV_FILE}")"
+  cat > "${PLATFORM_ENV_FILE}" <<EOF
+IMAGE_NAME=${IMAGE_NAME}
+CUDA_BASE_IMAGE=${SELECTED_CUDA_IMAGE}
+GENERATED_AT=$(date -Iseconds)
+EOF
+  chmod 600 "${PLATFORM_ENV_FILE}"
+}
+
 write_dockerfile() {
+  [[ -n "${SELECTED_CUDA_IMAGE}" ]] || err "SELECTED_CUDA_IMAGE is empty."
   log "Writing /root/private-dev-image.Dockerfile ..."
-  cat > /root/private-dev-image.Dockerfile <<'EOF'
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+  cat > /root/private-dev-image.Dockerfile <<EOF
+FROM ${SELECTED_CUDA_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -132,6 +278,51 @@ USAGE
 die() {
   echo "[ERROR] $*" >&2
   exit 1
+}
+
+ensure_shell_init_files() {
+  local user_home="$1"
+  local bashrc_file="${user_home}/.bashrc"
+  local profile_file="${user_home}/.profile"
+
+  if [[ ! -f "${bashrc_file}" ]]; then
+    if [[ -f /etc/skel/.bashrc ]]; then
+      cp /etc/skel/.bashrc "${bashrc_file}"
+    else
+      cat > "${bashrc_file}" <<'INNER_EOF'
+# ~/.bashrc
+case $- in
+  *i*) ;;
+  *) return;;
+esac
+INNER_EOF
+    fi
+  fi
+
+  if [[ ! -f "${profile_file}" ]]; then
+    if [[ -f /etc/skel/.profile ]]; then
+      cp /etc/skel/.profile "${profile_file}"
+    else
+      cat > "${profile_file}" <<'INNER_EOF'
+# ~/.profile
+if [ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+fi
+INNER_EOF
+    fi
+  fi
+
+  if ! grep -Eq '(^|[[:space:]])(\.|source)[[:space:]]+"?\$HOME/\.bashrc"?([[:space:]]|$)' "${profile_file}" && ! grep -q '\.bashrc' "${profile_file}"; then
+    cat >> "${profile_file}" <<'INNER_EOF'
+
+# Ensure interactive login shells load ~/.bashrc
+if [ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+fi
+INNER_EOF
+  fi
+
+  chmod 644 "${bashrc_file}" "${profile_file}"
 }
 
 is_port_busy() {
@@ -201,6 +392,7 @@ mkdir -p "${USER_HOME}/.ssh"
 chmod 700 "${USER_HOME}/.ssh"
 printf '%s\n' "${PUBKEY}" > "${USER_HOME}/.ssh/authorized_keys"
 chmod 600 "${USER_HOME}/.ssh/authorized_keys"
+ensure_shell_init_files "${USER_HOME}"
 chown -R root:root "${USER_HOME}"
 
 docker run -d \
@@ -332,6 +524,51 @@ USAGE
 
 die() { echo "[ERROR] $*" >&2; exit 1; }
 
+ensure_shell_init_files() {
+  local user_home="$1"
+  local bashrc_file="${user_home}/.bashrc"
+  local profile_file="${user_home}/.profile"
+
+  if [[ ! -f "${bashrc_file}" ]]; then
+    if [[ -f /etc/skel/.bashrc ]]; then
+      cp /etc/skel/.bashrc "${bashrc_file}"
+    else
+      cat > "${bashrc_file}" <<'INNER_EOF'
+# ~/.bashrc
+case $- in
+  *i*) ;;
+  *) return;;
+esac
+INNER_EOF
+    fi
+  fi
+
+  if [[ ! -f "${profile_file}" ]]; then
+    if [[ -f /etc/skel/.profile ]]; then
+      cp /etc/skel/.profile "${profile_file}"
+    else
+      cat > "${profile_file}" <<'INNER_EOF'
+# ~/.profile
+if [ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+fi
+INNER_EOF
+    fi
+  fi
+
+  if ! grep -Eq '(^|[[:space:]])(\.|source)[[:space:]]+"?\$HOME/\.bashrc"?([[:space:]]|$)' "${profile_file}" && ! grep -q '\.bashrc' "${profile_file}"; then
+    cat >> "${profile_file}" <<'INNER_EOF'
+
+# Ensure interactive login shells load ~/.bashrc
+if [ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+fi
+INNER_EOF
+  fi
+
+  chmod 644 "${bashrc_file}" "${profile_file}"
+}
+
 get_container_by_label() {
   local username="$1"
   docker ps -a --filter "label=private.dev.managed=true" --filter "label=private.dev.username=${username}" --format '{{.Names}}'
@@ -384,6 +621,7 @@ fi
 USER_HOME="${BASE_HOME}/${USERNAME}"
 [[ -d "${USER_HOME}" ]] || die "User home directory not found: ${USER_HOME}"
 [[ -d "${SHARE_DIR}" ]] || die "Share directory not found: ${SHARE_DIR}"
+ensure_shell_init_files "${USER_HOME}"
 
 if ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -447,6 +685,51 @@ USAGE
 
 die() { echo "[ERROR] $*" >&2; exit 1; }
 
+ensure_shell_init_files() {
+  local user_home="$1"
+  local bashrc_file="${user_home}/.bashrc"
+  local profile_file="${user_home}/.profile"
+
+  if [[ ! -f "${bashrc_file}" ]]; then
+    if [[ -f /etc/skel/.bashrc ]]; then
+      cp /etc/skel/.bashrc "${bashrc_file}"
+    else
+      cat > "${bashrc_file}" <<'INNER_EOF'
+# ~/.bashrc
+case $- in
+  *i*) ;;
+  *) return;;
+esac
+INNER_EOF
+    fi
+  fi
+
+  if [[ ! -f "${profile_file}" ]]; then
+    if [[ -f /etc/skel/.profile ]]; then
+      cp /etc/skel/.profile "${profile_file}"
+    else
+      cat > "${profile_file}" <<'INNER_EOF'
+# ~/.profile
+if [ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+fi
+INNER_EOF
+    fi
+  fi
+
+  if ! grep -Eq '(^|[[:space:]])(\.|source)[[:space:]]+"?\$HOME/\.bashrc"?([[:space:]]|$)' "${profile_file}" && ! grep -q '\.bashrc' "${profile_file}"; then
+    cat >> "${profile_file}" <<'INNER_EOF'
+
+# Ensure interactive login shells load ~/.bashrc
+if [ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+fi
+INNER_EOF
+  fi
+
+  chmod 644 "${bashrc_file}" "${profile_file}"
+}
+
 get_container_by_label() {
   local username="$1"
   docker ps -a --filter "label=private.dev.managed=true" --filter "label=private.dev.username=${username}" --format '{{.Names}}'
@@ -503,6 +786,7 @@ docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}" || die "Contai
 USER_HOME="${BASE_HOME}/${USERNAME}"
 [[ -d "${USER_HOME}" ]] || die "User home directory not found: ${USER_HOME}"
 [[ -d "${SHARE_DIR}" ]] || die "Share directory not found: ${SHARE_DIR}"
+ensure_shell_init_files "${USER_HOME}"
 
 WAS_RUNNING="0"
 if docker inspect --format '{{.State.Running}}' "${CONTAINER_NAME}" | grep -q '^true$'; then
@@ -814,25 +1098,9 @@ done
 EOF
 }
 
-ensure_cuda_base_image() {
-  log "Ensuring CUDA base image exists..."
-  if docker image inspect "${CUDA_IMAGE}" >/dev/null 2>&1; then
-    return 0
-  fi
-
-  if docker pull "${CUDA_IMAGE}" >/dev/null 2>&1; then
-    return 0
-  fi
-  if docker pull "docker.m.daocloud.io/${CUDA_IMAGE}" >/dev/null 2>&1; then
-    docker tag "docker.m.daocloud.io/${CUDA_IMAGE}" "${CUDA_IMAGE}"
-    return 0
-  fi
-  if docker pull "swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/${CUDA_IMAGE}" >/dev/null 2>&1; then
-    docker tag "swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/${CUDA_IMAGE}" "${CUDA_IMAGE}"
-    return 0
-  fi
-
-  err "Failed to pull CUDA base image from all configured sources."
+ensure_selected_cuda_image_cached() {
+  [[ -n "${SELECTED_CUDA_IMAGE}" ]] || err "No selected CUDA image."
+  docker image inspect "${SELECTED_CUDA_IMAGE}" >/dev/null 2>&1 || err "Selected CUDA image is missing locally: ${SELECTED_CUDA_IMAGE}"
 }
 
 write_all_scripts() {
@@ -855,10 +1123,20 @@ build_base_image() {
 final_verify() {
   log "Verification..."
   docker image inspect "${IMAGE_NAME}" >/dev/null
+  ensure_selected_cuda_image_cached
   docker info >/dev/null
+  nvidia-smi -L >/dev/null
+  docker run --rm --gpus all --entrypoint nvidia-smi "${IMAGE_NAME}" -L >/dev/null 2>&1 || warn "Base image GPU smoke test failed; inspect runtime on this host."
+  bash -n /root/creater_user.sh
+  bash -n /root/rebuild_user_container.sh
+  bash -n /root/rebuild_user_container_keep_data.sh
+  bash -n /root/user_storage_usage.sh
+  bash -n /root/blame_gpu_use.sh
   sshd -t
   echo
   echo "[OK] Bootstrap completed."
+  echo "[INFO] Selected CUDA base image: ${SELECTED_CUDA_IMAGE}"
+  echo "[INFO] Platform metadata: ${PLATFORM_ENV_FILE}"
   echo "[INFO] Key scripts:"
   echo "  /root/creater_user.sh"
   echo "  /root/rebuild_user_container_keep_data.sh"
@@ -868,15 +1146,20 @@ final_verify() {
 
 main() {
   require_root
+  ensure_base_requirements
   ensure_data_mount
+  check_network_access
   install_base_packages
   install_nvidia_toolkit
   configure_docker_runtime
+  ensure_nvidia_driver_ready
+  detect_working_cuda_image
+  write_platform_env
   configure_host_ssh_policy
   prepare_data_dirs
   write_dockerfile
   write_all_scripts
-  ensure_cuda_base_image
+  ensure_selected_cuda_image_cached
   build_base_image
   final_verify
 }
