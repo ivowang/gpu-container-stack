@@ -78,7 +78,7 @@ sudo ./setup.sh
 /root/delete_user.sh <username> --purge-home
 ```
 
-### Rebuild (reset mode)
+### Rebuild + Reset
 
 Resets non-mounted container layer, keeps `/root` and `/share` mounts:
 
@@ -86,12 +86,12 @@ Resets non-mounted container layer, keeps `/root` and `/share` mounts:
 /root/rebuild_user_container.sh <username>
 ```
 
-### Rebuild (keep-data mode)
+### Rebuild + Retain
 
 Preserves mounted data and container writable-layer data (snapshot + recreate):
 
 ```bash
-/root/rebuild_user_container_keep_data.sh <username> --shm-size 256g
+/root/rebuild_user_container_keep_data.sh <username>
 ```
 
 ### Storage accounting
@@ -105,16 +105,6 @@ Preserves mounted data and container writable-layer data (snapshot + recreate):
 ```bash
 /root/blame_gpu_use.sh
 ```
-
-## Post-Install Validation
-
-```bash
-docker images | grep private-dev:ssh-gpu
-sshd -T | egrep 'allowusers|permitrootlogin'
-nvidia-smi -L
-```
-
-Optional: create one test user and verify login + GPU inside container.
 
 ## Idempotency and Safety Notes
 
