@@ -1,4 +1,4 @@
-# Private GPU Server Bootstrap (`setup.sh`)
+# GPU Server Bootstrap (`setup.sh`)
 
 This repository contains a single bootstrap script:
 
